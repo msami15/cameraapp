@@ -58,10 +58,6 @@ export interface MjpegStartOptions {
 function buildRequest(host: string, port: number, path: string): string {
   return (
     `GET ${path} HTTP/1.1\r\n` +
-    // Confirmed byte-for-byte from a working capture — the camera's
-    // firmware appears to be picky about this and the official app always
-    // sends this exact string (it's the ffmpeg/libavformat default UA,
-    // since GPCamLib is built on it under the hood).
     'User-Agent: Lavf/58.12.100\r\n' +
     'Accept: */*\r\n' +
     'Range: bytes=0-\r\n' +
