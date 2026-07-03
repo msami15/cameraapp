@@ -3,19 +3,25 @@
  *
  * Manages the control-channel TCP socket (port 8081) to the camera:
  *  - Opens the connection and performs the exact session handshake the
- *    official app performs before requesting video — confirmed from a full
- *    capture of a working session (see GPSocketProtocol.ts header comment).
- *    Port 8080 is refused by the camera until this completes.
+ *    official app performs before requesting video — confirmed from two
+ *    independent full captures of working sessions (see
+ *    GPSocketProtocol.ts header comment). Port 8080 refuses connections
+ *    until this completes.
  *  - Sends a heartbeat every 500ms to keep the session alive, matching the
- *    cadence observed in the capture.
+ *    cadence observed in both captures.
  *  - Exposes capturePhoto() and toggleRecord(), which write straight to the
  *    SD card in the camera (not the phone).
  *
- * The handshake is sequenced step-by-step, waiting for each real ack before
- * sending the next command — not a fixed delay. A fixed delay alone left
- * the camera never enabling port 8080 because two required steps (the
- * 0x01 status query and the 0x00 finalize) were previously missing
- * entirely, regardless of how long we waited.
+ * IMPORTANT — the 0x02 step: sending cmd 0x02 makes the camera stream back
+ * a large multi-chunk ~14KB blob (a WAV-header-prefixed audio resource,
+ * unrelated to video). In both captures, the real app always waited for
+ * that ENTIRE blob to finish arriving (~90-150ms of streaming) before
+ * sending the next command (0x08). Resolving early on just the first chunk
+ * and writing 0x08 while the blob is still mid-transmission reliably makes
+ * the camera's simple embedded stack never answer 0x08 at all — that was
+ * the root cause of "connecting -> disconnected" with a timeout on cmd=8.
+ * So step 0x02 below uses a fixed drain delay instead of waiting for a
+ * single ack frame.
  */
 
 import {Buffer} from 'buffer';
@@ -38,14 +44,12 @@ export const CONTROL_PORT = 8081;
 export const STREAM_PORT = 8080;
 export const STREAM_PATH = '/?action=stream';
 
-// Small buffer after the handshake's last ack before requesting video,
-// matching the ~480ms gap observed in the real capture between the last
-// handshake ack and the app's first GET on port 8080.
 export const POST_HANDSHAKE_DELAY_MS = 500;
 
-// Per-step ack timeout. The 0x02 step in particular can take ~100ms since
-// the camera replies with a large multi-packet blob.
-const STEP_TIMEOUT_MS = 2000;
+const STEP_TIMEOUT_MS = 3000;
+// Observed audio-blob drain time was ~90-150ms in both captures; give it a
+// generous margin before writing the next command.
+const AUDIO_DRAIN_DELAY_MS = 350;
 
 export type ConnectionStatus =
   | 'disconnected'
@@ -64,25 +68,35 @@ interface CameraConnectionEvents {
   onRawData?: (chunk: Buffer) => void;
 }
 
-// The exact session-open sequence confirmed from a full working-session
-// capture (see GPSocketProtocol.ts). Each step is sent and (except the
-// last, fire-and-forget step) waited on for its real ack before the next
-// step is sent — this ordering + waiting is what actually opens port 8080
-// server-side.
 interface HandshakeStep {
   context: number;
   cmdId: number;
   payload?: Buffer;
-  /** If false, don't wait for an ack — fire and forget (cmd 0x04 only). */
+  /** Set false to fire-and-forget instead of waiting for a matching reply. */
   waitForAck?: boolean;
+  /** Extra fixed delay after this step completes (see 0x02 note above). */
+  postDelayMs?: number;
 }
 
+export function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Confirmed byte-for-byte order from two independent full-session captures.
+// The 0x05 login payload varies session to session (likely a timestamp or
+// nonce) — the camera doesn't appear to validate its contents, just that
+// 4 bytes are present, so we reuse a captured value rather than guessing.
 export const HANDSHAKE_STEPS: HandshakeStep[] = [
-  {context: Context.SYSTEM, cmdId: 0x05, payload: LOGIN_PAYLOAD}, // login
-  {context: Context.SYSTEM, cmdId: 0x01}, // status query
-  {context: Context.SYSTEM, cmdId: 0x02}, // capabilities fetch (large reply)
+  {context: Context.SYSTEM, cmdId: 0x05, payload: LOGIN_PAYLOAD},
+  {context: Context.SYSTEM, cmdId: 0x01},
+  {
+    context: Context.SYSTEM,
+    cmdId: 0x02,
+    waitForAck: false,
+    postDelayMs: AUDIO_DRAIN_DELAY_MS,
+  },
   {context: Context.SYSTEM, cmdId: 0x08, payload: Buffer.from([0x00])},
-  {context: Context.SYSTEM, cmdId: 0x00, payload: Buffer.from([0x00])}, // finalize
+  {context: Context.SYSTEM, cmdId: 0x00, payload: Buffer.from([0x00])},
   {context: Context.SYSTEM, cmdId: 0x04, waitForAck: false},
 ];
 
@@ -97,6 +111,7 @@ export class CameraConnection {
   private events: CameraConnectionEvents;
   private status: ConnectionStatus = 'disconnected';
   private _isRecording = false;
+  private pendingAcks = new Map<string, (frame: GPSocketFrame) => void>();
 
   constructor(events: CameraConnectionEvents = {}) {
     this.events = events;
@@ -114,9 +129,6 @@ export class CameraConnection {
     this.status = status;
     this.events.onStatusChange?.(status);
   }
-
-  /** Frames waiting for an ack, keyed by "context:cmdId". Resolved in handleFrame(). */
-  private pendingAcks = new Map<string, (frame: GPSocketFrame) => void>();
 
   private waitForAck(
     context: number,
@@ -149,6 +161,9 @@ export class CameraConnection {
       if (step.waitForAck !== false) {
         await waitP;
       }
+      if (step.postDelayMs) {
+        await delay(step.postDelayMs);
+      }
     }
   }
 
@@ -168,9 +183,7 @@ export class CameraConnection {
         async () => {
           try {
             await this.runHandshake(socket);
-            // Small buffer after the last ack before requesting video,
-            // matching the real capture's timing.
-            await new Promise(r => setTimeout(r, postHandshakeDelayMs));
+            await delay(postHandshakeDelayMs);
             this.startHeartbeat();
             if (!settled) {
               settled = true;
@@ -219,10 +232,6 @@ export class CameraConnection {
   }
 
   private handleFrame(frame: GPSocketFrame) {
-    // Resolve any handshake step waiting on this exact context/cmdId,
-    // regardless of msgType — cmd 0x08's real ack is msgType 0x03, not the
-    // usual 0x02, and cmd 0x02's ack arrives as several chunked frames, the
-    // first of which is enough to consider that step complete.
     const key = `${frame.context}:${frame.cmdId}`;
     const pending = this.pendingAcks.get(key);
     if (pending && isReplyTo(frame, frame.context, frame.cmdId)) {
