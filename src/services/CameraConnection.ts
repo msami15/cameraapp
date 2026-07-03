@@ -2,8 +2,8 @@
  * CameraConnection.ts
  * 
  * Manages the control-channel TCP socket (port 8081) to the camera.
- * Bypasses the cmdId=0x02 XML menu dump to prevent socket timeouts,
- * ensuring a fast and stable connection for the video stream.
+ * Includes a pre-handshake delay to allow the camera firmware to wake up
+ * and bypasses the massive XML menu dump to prevent socket timeouts.
  */
 
 import { Buffer } from 'buffer';
@@ -51,7 +51,7 @@ export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// THE FIX: Removed cmdId=0x02 and cmdId=0x08 entirely to skip the massive XML settings dump
+// THE FIX: Bypass cmdId=0x02 and cmdId=0x08 entirely to skip the massive XML settings dump
 export const HANDSHAKE_STEPS: HandshakeStep[] = [
   { context: Context.SYSTEM, cmdId: 0x05, payload: LOGIN_PAYLOAD },
   { context: Context.SYSTEM, cmdId: 0x01 },
@@ -134,6 +134,9 @@ export class CameraConnection {
         { host, port, tls: false },
         async () => {
           try {
+            // THE FIX: Give the camera's processor 250ms to wake up before firing the login command
+            await delay(250);
+            
             await this.runHandshake(socket);
             await delay(postHandshakeDelayMs);
             this.startHeartbeat();
