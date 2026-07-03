@@ -2,50 +2,52 @@
  * GPSocketProtocol.ts
  *
  * Byte-level implementation of the camera's proprietary "GPSOCKET" control
- * protocol (GeneralPlus GPCamLib SDK), reverse engineered from a packet
- * capture of the official GoPlusCam app talking to the camera on TCP 8081.
+ * protocol (GeneralPlus GPCamLib SDK), reverse engineered from a full
+ * packet capture of a working session between the official GoPlusCam app
+ * and the camera on TCP 8081.
  *
  * Frame layout (all requests we send use msgType = REQUEST):
  *
  *   Offset  Size  Field
  *   0       8     ASCII magic "GPSOCKET"
- *   8       1     msgType   (0x01 = request, 0x02 = response)
+ *   8       1     msgType   (0x01 = request, 0x02 = response, 0x03 = notify)
  *   9       1     reserved  (always 0x00 on requests we send)
  *   10      1     context   (0x00 = session/system, 0x03 = capture/record)
  *   11      1     cmdId     (command identifier, see below)
  *   12+     n     payload   (command-specific, may be empty)
  *
- * Confirmed from a full session-open capture (control channel only, before
- * any video request succeeded):
+ * Confirmed handshake sequence (control channel, before video ever works) —
+ * cross-checked against TWO independent full-session captures, including
+ * one full successful ~50s video session:
  *
- *   -> cmd 0x05 payload [4b 43 10 24]   (login/session-open)
- *   <- ack, payload [06 00 37 e4 36 a5 75 97]              (session token)
- *   -> cmd 0x01 (no payload)            (status query)
+ *   -> cmd 0x05 payload [4 bytes]   login / session-open. This value
+ *                                    differed between the two captures
+ *                                    (813c6b06 vs 4b431024) — the camera
+ *                                    doesn't appear to validate the actual
+ *                                    bytes, just that 4 bytes are present.
+ *   <- ack, 8-byte session token
+ *   -> cmd 0x01 (no payload)        status query
  *   <- ack, 16-byte device status blob
- *   -> cmd 0x02 (no payload)            (capabilities/audio-config fetch —
- *                                         camera replies with a large ~14KB
- *                                         WAV-header-prefixed blob spread
- *                                         across many packets; harmless to
- *                                         ignore the contents, but the round
- *                                         trip must complete)
- *   <- ack (large, multi-chunk)
+ *   -> cmd 0x02 (no payload)        triggers a large (~14KB) multi-chunk
+ *                                    WAV-header-prefixed audio-resource
+ *                                    blob spread across ~10 TCP segments
+ *                                    over roughly 90-150ms. CRITICAL: the
+ *                                    real app always waits for this ENTIRE
+ *                                    blob to finish arriving before sending
+ *                                    the next command — resolving early on
+ *                                    just the first chunk and writing 0x08
+ *                                    while it's still streaming reliably
+ *                                    makes the camera never answer 0x08 at
+ *                                    all (see CameraConnection.ts).
  *   -> cmd 0x08 payload [00]
  *   <- msgType 0x03(!) ack, payload [ff ff]
- *   -> cmd 0x00 payload [00]            (session finalize / "ready")
+ *   -> cmd 0x00 payload [00]        session finalize / "ready"
  *   <- ack, payload [00 00]
- *   -> cmd 0x04 (no payload, fire-and-forget — response arrives late and
- *                isn't required before requesting video)
+ *   -> cmd 0x04 (no payload, fire-and-forget)
  *
- * THIS FULL SEQUENCE, IN ORDER, WITH REAL ACKS WAITED ON, is what actually
- * opens port 8080 server-side. Earlier attempts that sent only a subset
- * (missing 0x01 and 0x00) or that just waited a fixed delay without real
- * acks left the camera never enabling the video port — every connection
- * on 8080 was refused/reset instantly. Once this sequence completes,
- * requesting GET /?action=stream on port 8080 works immediately.
- *
- * After the sequence, the app polls ctx=0x00 cmdId=0x01 (same shape as the
- * status query above) roughly every 500ms for the rest of the session —
- * that's the ongoing heartbeat.
+ * After this sequence, port 8080 accepts the MJPEG stream request. The app
+ * then polls ctx=0x00 cmdId=0x01 (same shape as the status query above)
+ * roughly every 500ms as an ongoing heartbeat.
  *
  *   - Capture photo         : ctx=0x03 cmdId=0x01 payload=[0x41]
  *   - Toggle video record   : ctx=0x03 cmdId=0x06 payload=[0x41]
@@ -77,13 +79,12 @@ export enum CmdId {
 }
 
 // The trailing byte the real app always sends with capture/record commands.
-// We don't know its semantic meaning (SDK constant / camera-selector /
-// confirm-flag) but it was 0x41 on every single observed call, so we
-// replicate it verbatim rather than guess.
+// Meaning unknown (SDK constant / camera-selector / confirm-flag) but it
+// was 0x41 on every observed call, so we replicate it verbatim.
 const CAPTURE_PAYLOAD = Buffer.from([0x41]);
 
 // Confirmed byte-for-byte from the login/handshake capture.
-export const LOGIN_PAYLOAD = Buffer.from([0x4b, 0x43, 0x10, 0x24]);
+export const LOGIN_PAYLOAD = Buffer.from([0x81, 0x3c, 0x6b, 0x06]);
 
 export interface GPSocketFrame {
   msgType: number;
@@ -125,11 +126,6 @@ export class GPSocketFrameParser {
   push(chunk: Buffer): GPSocketFrame[] {
     this.buffer = Buffer.concat([this.buffer, chunk]);
     const frames: GPSocketFrame[] = [];
-
-    // Every observed response is short (<= ~20 bytes) and there is no
-    // explicit length field in the header, so we frame on the next
-    // occurrence of the magic bytes (or end of buffer for the last one).
-    // This is conservative but matches all traffic seen in the capture.
 
     while (true) {
       const start = this.buffer.indexOf(GP_MAGIC_BYTES);
@@ -181,11 +177,10 @@ export function isSuccessResponse(frame: GPSocketFrame): boolean {
 }
 
 /**
- * True if a frame is *any* reply (ack or notify) to a given context/cmdId —
- * used by the handshake sequencer, which only needs to know "the camera
- * replied to this step" and not necessarily a 00 00 success code (cmd 0x08's
- * real-world reply is msgType 0x03 with payload ff ff, which still means
- * "handled", not an error).
+ * True if a frame is any reply (ack or notify) to a given context/cmdId —
+ * used by the handshake sequencer, which only needs "the camera replied to
+ * this step", not necessarily a 00 00 success code (cmd 0x08's real reply
+ * is msgType 0x03 with payload ff ff, which still means "handled").
  */
 export function isReplyTo(
   frame: GPSocketFrame,
