@@ -2,8 +2,8 @@
  * CameraConnection.ts
  * 
  * Manages the control-channel TCP socket (port 8081) to the camera.
- * Implements an adaptive silence detection mechanism for command 0x02 to handle
- * the large multi-chunk audio response without inducing firmware lockups.
+ * Bypasses the cmdId=0x02 XML menu dump to prevent socket timeouts,
+ * ensuring a fast and stable connection for the video stream.
  */
 
 import { Buffer } from 'buffer';
@@ -28,8 +28,6 @@ export const STREAM_PATH = '/?action=stream';
 export const POST_HANDSHAKE_DELAY_MS = 500;
 
 const STEP_TIMEOUT_MS = 3000;
-const DRAIN_SILENCE_WINDOW_MS = 400; // Must be perfectly quiet for 400ms
-const DRAIN_MAX_TIMEOUT_MS = 4000;   // Hard cutoff safety valve
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
@@ -47,23 +45,16 @@ interface HandshakeStep {
   cmdId: number;
   payload?: Buffer;
   waitForAck?: boolean;
-  isDrainStep?: boolean;
 }
 
 export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// THE FIX: Removed cmdId=0x02 and cmdId=0x08 entirely to skip the massive XML settings dump
 export const HANDSHAKE_STEPS: HandshakeStep[] = [
   { context: Context.SYSTEM, cmdId: 0x05, payload: LOGIN_PAYLOAD },
   { context: Context.SYSTEM, cmdId: 0x01 },
-  {
-    context: Context.SYSTEM,
-    cmdId: 0x02,
-    waitForAck: false,
-    isDrainStep: true, // Use adaptive silence tracing
-  },
-  { context: Context.SYSTEM, cmdId: 0x08, payload: Buffer.from([0x00]) },
   { context: Context.SYSTEM, cmdId: 0x00, payload: Buffer.from([0x00]) },
   { context: Context.SYSTEM, cmdId: 0x04, waitForAck: false },
 ];
@@ -76,7 +67,6 @@ export class CameraConnection {
   private status: ConnectionStatus = 'disconnected';
   private _isRecording = false;
   private pendingAcks = new Map<string, (frame: GPSocketFrame) => void>();
-  private lastDataReceivedTime = 0;
 
   constructor(events: CameraConnectionEvents = {}) {
     this.events = events;
@@ -115,23 +105,6 @@ export class CameraConnection {
     });
   }
 
-  /**
-   * Loops dynamically and checks data throughput cadence.
-   * Resolves only when no new bytes hit the interface for the duration of DRAIN_SILENCE_WINDOW_MS.
-   */
-  private async waitForBufferDrain(): Promise<void> {
-    const startTime = Date.now();
-    this.lastDataReceivedTime = Date.now();
-
-    while (Date.now() - startTime < DRAIN_MAX_TIMEOUT_MS) {
-      await delay(40);
-      const idleDuration = Date.now() - this.lastDataReceivedTime;
-      if (idleDuration >= DRAIN_SILENCE_WINDOW_MS) {
-        return; 
-      }
-    }
-  }
-
   private async runHandshake(socket: any): Promise<void> {
     for (const step of HANDSHAKE_STEPS) {
       const waitP = step.waitForAck === false
@@ -142,10 +115,6 @@ export class CameraConnection {
 
       if (step.waitForAck !== false) {
         await waitP;
-      }
-
-      if (step.isDrainStep) {
-        await this.waitForBufferDrain();
       }
     }
   }
@@ -186,7 +155,6 @@ export class CameraConnection {
       );
 
       socket.on('data', (data: string | Buffer) => {
-        this.lastDataReceivedTime = Date.now(); // Feed timestamp update for the drain loop
         const buf = typeof data === 'string' ? Buffer.from(data, 'base64') : data;
         this.events.onRawData?.(buf);
         
